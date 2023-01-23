@@ -30,9 +30,1018 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 #include <ipxe/efi/efi.h>
 #include <ipxe/efi/efi_strings.h>
 #include <ipxe/efi/efi_hii.h>
+#include <ipxe/efi/Protocol/HiiString.h>
+#include <ipxe/efi/Protocol/HiiPopup.h>
+#include <ipxe/efi/Protocol/HiiConfigRouting.h>
+#include <ipxe/efi/Protocol/FormBrowser2.h>
+#include <ipxe/efi/efi_ionic.h>
+
+EFI_GUID gEfiHiiConfigRoutingProtocolGuid = EFI_HII_CONFIG_ROUTING_PROTOCOL_GUID;
+EFI_HII_CONFIG_ROUTING_PROTOCOL   *gHiiConfigRouting = NULL;
+EFI_FORM_BROWSER2_PROTOCOL        *mUefiFormBrowser2 = NULL;
+CONST CHAR16 mConfigHdrTemplate[] = L"GUID=00000000000000000000000000000000&NAME=0000&PATH=00";
+CHAR8    *gSupportedLanguages = NULL;
+
+static void * efi_ifr_op ( struct efi_ifr_builder *ifr, unsigned int opcode,size_t len );
+
+#define EFI_IFR_ONE_OF_OPTION_BASE_SIZE        6
+
+///
+/// Lookup table that converts EFI_IFR_TYPE_X enum values to a width in bytes
+///
+UINT8 mHiiDefaultTypeToWidth[] = {
+    1, // EFI_IFR_TYPE_NUM_SIZE_8
+    2, // EFI_IFR_TYPE_NUM_SIZE_16
+    4, // EFI_IFR_TYPE_NUM_SIZE_32
+    8, // EFI_IFR_TYPE_NUM_SIZE_64
+    1, // EFI_IFR_TYPE_BOOLEAN
+    3, // EFI_IFR_TYPE_TIME
+    4, // EFI_IFR_TYPE_DATE
+    2  // EFI_IFR_TYPE_STRING
+};
+
+UINT8 mNumericDefaultTypeToWidth[] = {
+    3, // EFI_IFR_TYPE_NUM_SIZE_8
+    6, // EFI_IFR_TYPE_NUM_SIZE_16
+    12, // EFI_IFR_TYPE_NUM_SIZE_32
+    24, // EFI_IFR_TYPE_NUM_SIZE_64
+};
 
 /** Tiano GUID */
 static const EFI_GUID tiano_guid = EFI_IFR_TIANO_GUID;
+EFI_GUID gEfiHiiStringProtocolGuid = EFI_HII_STRING_PROTOCOL_GUID;
+
+EFI_HII_STRING_PROTOCOL        *gHiiString;
+
+CHAR8 *
+EFIAPI
+GetBestLanguage (
+    IN CONST CHAR8    *SupportedLanguages,
+    IN UINTN        Iso639Language,
+    ...
+)
+{
+    VA_LIST        Args;
+    CHAR8        *Language;
+    UINTN        CompareLength;
+    UINTN        LanguageLength;
+    CONST CHAR8    *Supported;
+    CHAR8        *BestLanguage;
+    EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
+
+    VA_START (Args, Iso639Language);
+    while ((Language = VA_ARG (Args, CHAR8 *)) != NULL) {
+    //
+    // Default to ISO 639-2 mode
+    //
+    CompareLength  = 3;
+    LanguageLength = MIN (3, strlen (Language));
+
+    //
+    // If in RFC 4646 mode, then determine the length of the first RFC 4646 language code in Language
+    //
+    if (Iso639Language == 0) {
+        for (LanguageLength = 0; Language[LanguageLength] != 0 && Language[LanguageLength] != ';'; LanguageLength++);
+    }
+
+    //
+    // Trim back the length of Language used until it is empty
+    //
+    while (LanguageLength > 0) {
+        //
+        // Loop through all language codes in SupportedLanguages
+        //
+        for (Supported = SupportedLanguages; *Supported != '\0'; Supported += CompareLength) {
+        //
+        // In RFC 4646 mode, then Loop through all language codes in SupportedLanguages
+        //
+        if (Iso639Language == 0) {
+          //
+          // Skip ';' characters in Supported
+          //
+          for (; *Supported != '\0' && *Supported == ';'; Supported++);
+          //
+          // Determine the length of the next language code in Supported
+          //
+          for (CompareLength = 0; Supported[CompareLength] != 0 && Supported[CompareLength] != ';'; CompareLength++);
+          //
+          // If Language is longer than the Supported, then skip to the next language
+          //
+          if (LanguageLength > CompareLength) {
+            continue;
+          }
+        }
+        //
+        // See if the first LanguageLength characters in Supported match Language
+        //
+        if (strncmp (Supported, Language, LanguageLength) == 0) {
+          VA_END (Args);
+          //
+          // Allocate, copy, and return the best matching language code from SupportedLanguages
+          //
+          bs->AllocatePool ( EfiBootServicesData, CompareLength + 1 ,(VOID **)&BestLanguage );
+            bs->SetMem(BestLanguage,CompareLength + 1,0);
+
+          if (BestLanguage == NULL) {
+            return NULL;
+          }
+
+          return generic_memcpy (BestLanguage, Supported, CompareLength);
+        }
+      }
+
+      if (Iso639Language != 0) {
+        //
+        // If ISO 639 mode, then each language can only be tested once
+        //
+        LanguageLength = 0;
+      } else {
+        //
+        // If RFC 4646 mode, then trim Language from the right to the next '-' character
+        //
+        for (LanguageLength--; LanguageLength > 0 && Language[LanguageLength] != '-'; LanguageLength--);
+      }
+    }
+  }
+  VA_END (Args);
+
+  //
+  // No matches were found
+  //
+  return NULL;
+}
+
+CHAR8 *
+EFIAPI
+HiiGetSupportedLanguages (
+  IN EFI_HII_HANDLE           HiiHandle
+  )
+{
+  EFI_STATUS  Status;
+  UINTN       LanguageSize;
+  CHAR8       TempSupportedLanguages;
+  CHAR8       *SupportedLanguages;
+  EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
+
+
+  //
+  // Retrieve the size required for the supported languages buffer.
+  //
+  LanguageSize = 0;
+  Status = gHiiString->GetLanguages (gHiiString, HiiHandle, &TempSupportedLanguages, &LanguageSize);
+
+  //
+  // If GetLanguages() returns EFI_SUCCESS for a zero size,
+  // then there are no supported languages registered for HiiHandle.  If GetLanguages()
+  // returns an error other than EFI_BUFFER_TOO_SMALL, then HiiHandle is not present
+  // in the HII Database
+  //
+  if (Status != EFI_BUFFER_TOO_SMALL) {
+    //
+    // Return NULL if the size can not be retrieved, or if HiiHandle is not in the HII Database
+    //
+    return NULL;
+  }
+
+  //
+  // Allocate the supported languages buffer.
+  //
+  bs->AllocatePool ( EfiBootServicesData, LanguageSize ,(VOID **)&SupportedLanguages );
+
+  if (SupportedLanguages == NULL) {
+    //
+    // Return NULL if allocation fails.
+    //
+    return NULL;
+  }
+  bs->SetMem(SupportedLanguages,LanguageSize,0);
+
+  //
+  // Retrieve the supported languages string
+  //
+  Status = gHiiString->GetLanguages (gHiiString, HiiHandle, SupportedLanguages, &LanguageSize);
+  if (EFI_ERROR (Status)) {
+    //
+    // Free the buffer and return NULL if the supported languages can not be retrieved.
+    //
+    bs->FreePool (SupportedLanguages);
+    return NULL;
+  }
+
+  //
+  // Return the Null-terminated ASCII string of supported languages
+  //
+  return SupportedLanguages;
+}
+
+EFI_STRING
+EFIAPI
+HiiGetString (
+  IN EFI_HII_HANDLE  HiiHandle,
+  IN EFI_STRING_ID   StringId,
+  IN OUT UINT8        *StringLen,
+  IN CONST CHAR8     *Language  OPTIONAL
+  )
+{
+  EFI_STATUS  Status;
+  UINTN       StringSize;
+  CHAR16      TempString;
+  EFI_STRING  String;
+  CHAR8       *SupportedLanguages;
+  CHAR8       *PlatformLanguage;
+  CHAR8       *BestLanguage;
+  EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
+
+  Status = bs->LocateProtocol ( &gEfiHiiStringProtocolGuid,
+                                  NULL,
+                                (void **) &gHiiString );
+  //
+  // Initialize all allocated buffers to NULL
+  //
+  SupportedLanguages = NULL;
+  PlatformLanguage   = NULL;
+  BestLanguage       = NULL;
+  String             = NULL;
+
+  //
+  // Get the languages that the package specified by HiiHandle supports
+  //
+  SupportedLanguages = HiiGetSupportedLanguages (HiiHandle);
+  if (SupportedLanguages == NULL) {
+    goto Error;
+  }
+  //
+  // If Languag is NULL, then set it to an empty string, so it will be
+  // skipped by GetBestLanguage()
+  //
+  if (Language == NULL) {
+    Language = "";
+  }
+
+  //
+  // Get the best matching language from SupportedLanguages
+  //
+  BestLanguage = GetBestLanguage (
+                   SupportedLanguages,
+                   FALSE,                                             // RFC 4646 mode
+                   Language,                                          // Highest priority
+                   PlatformLanguage != NULL ? PlatformLanguage : "",  // Next highest priority
+                   SupportedLanguages,                                // Lowest priority
+                   NULL
+                   );
+
+  if (BestLanguage == NULL) {
+    goto Error;
+  }
+  //
+  // Retrieve the size of the string in the string package for the BestLanguage
+  //
+  StringSize = 0;
+  Status = gHiiString->GetString (
+                         gHiiString,
+                         BestLanguage,
+                         HiiHandle,
+                         StringId,
+                         &TempString,
+                         &StringSize,
+                         NULL
+                         );
+  //
+  // If GetString() returns EFI_SUCCESS for a zero size,
+  // then there are no supported languages registered for HiiHandle.  If GetString()
+  // returns an error other than EFI_BUFFER_TOO_SMALL, then HiiHandle is not present
+  // in the HII Database
+  //
+  if (Status != EFI_BUFFER_TOO_SMALL) {
+    goto Error;
+  }
+
+  //
+  // Allocate a buffer for the return string
+  //
+  bs->AllocatePool ( EfiBootServicesData, StringSize ,(VOID **)&String );
+
+  if (String == NULL) {
+    goto Error;
+  }
+  bs->SetMem(String,StringSize,0);
+  //
+  // Retrieve the string from the string package
+  //
+  Status = gHiiString->GetString (
+                         gHiiString,
+                         BestLanguage,
+                         HiiHandle,
+                         StringId,
+                         String,
+                         &StringSize,
+                         NULL
+                         );
+
+  if (EFI_ERROR (Status)) {
+    //
+    // Free the buffer and return NULL if the supported languages can not be retrieved.
+    //
+    bs->FreePool (String);
+
+    String = NULL;
+  }
+
+Error:
+  //
+  // Free allocated buffers
+  //
+  if (SupportedLanguages != NULL) {
+    bs->FreePool (SupportedLanguages);
+
+  }
+  if (PlatformLanguage != NULL) {
+    bs->FreePool (PlatformLanguage);
+  }
+  if (BestLanguage != NULL) {
+    bs->FreePool (BestLanguage);
+  }
+
+  //
+  // Return the Null-terminated Unicode string
+  //
+  *StringLen = StringSize;
+
+  return String;
+}
+
+
+VOID
+HiiSetString (
+    IN  EFI_HII_HANDLE  HiiHandle,
+    IN  CHAR16          *String,
+    IN  EFI_STRING_ID   *StringId
+)
+{
+  EFI_STATUS      Status;
+  CHAR8*          Languages = NULL;
+  UINTN           LangSize = 0;
+  CHAR8*          CurrentLanguage;
+  BOOLEAN         LastLanguage = FALSE;
+  EFI_BOOT_SERVICES *gBS = efi_systab->BootServices;
+  EFI_STRING_ID   StrId;
+
+  StrId = *StringId;
+
+  if (gHiiString == NULL) {
+
+    Status = gBS->LocateProtocol ( &gEfiHiiStringProtocolGuid,
+                                NULL,
+                                (void **) &gHiiString );
+    if (EFI_ERROR(Status)) {
+      return;
+    }
+  }
+
+  if (gSupportedLanguages == NULL) {
+    Status = gHiiString->GetLanguages(gHiiString, HiiHandle, Languages, &LangSize);
+        if (Status == EFI_BUFFER_TOO_SMALL) {
+            Status = gBS->AllocatePool(EfiBootServicesData, LangSize, (VOID**)&Languages);
+            if (EFI_ERROR(Status)) {
+                //not enough resources to allocate string
+                return;
+            }
+            Status = gHiiString->GetLanguages(gHiiString, HiiHandle, Languages, &LangSize);
+            if(EFI_ERROR(Status)) {
+                return;
+            }
+        }
+        gSupportedLanguages=Languages;
+    } else {
+        Languages=gSupportedLanguages;
+    }
+
+    while(!LastLanguage) {
+
+        CurrentLanguage = Languages;
+
+        while(*Languages != ';' && *Languages != 0)
+            Languages++;
+        if (*Languages == 0) {
+            LastLanguage = TRUE;
+            Status = gHiiString->SetString(gHiiString, HiiHandle, StrId, CurrentLanguage, String, NULL);
+
+            if (EFI_ERROR(Status)) {
+                return;
+            }
+        } else {
+            *Languages = 0;
+            Status = gHiiString->SetString(gHiiString, HiiHandle, StrId, CurrentLanguage, String, NULL);
+            *Languages = ';';
+            Languages++;
+            if (EFI_ERROR(Status)) {
+                return;
+            }
+        }
+    }
+}
+
+unsigned int
+UnicodeSPrint (
+  OUT CHAR16        *Buffer,
+  IN  UINTN         BufferSize,
+  const char         *fmt,
+  ...
+  )
+{
+  va_list args;
+
+  int   NumberOfPrinted;
+
+  va_start ( args, fmt );
+  NumberOfPrinted = efi_vsnprintf ( Buffer, BufferSize, fmt, args );
+  va_end ( args );
+
+  return NumberOfPrinted;
+}
+
+VOID *
+EFIAPI InternalMemSetMem16 (
+  OUT     VOID                      *Buffer,
+  IN      UINTN                     Length,
+  IN      UINT16                    Value
+  )
+{
+  for (; Length != 0; Length--) {
+    ((UINT16*)Buffer)[Length - 1] = Value;
+  }
+  return Buffer;
+}
+
+UINTN EFIAPI InternalStrLen (
+  IN      CONST CHAR16              *String
+  )
+{
+  UINTN                             Length;
+
+  if(((UINTN) String & BIT0) != 0) return 0;
+
+  for (Length = 0; *String != L'\0'; String++, Length++) {
+  }
+  return Length;
+}
+
+CHAR16 * InternalStrCpy ( CHAR16 *dest, const CHAR16 *src )
+{
+	const UINT16 *src_bytes = ( ( const UINT16 * ) src );
+	UINT16 *dest_bytes = ( ( UINT16 * ) dest );
+
+	/* We cannot use strncpy(), since that would pad the destination */
+	for ( ; ; src_bytes++, dest_bytes++ ) {
+		*dest_bytes = *src_bytes;
+		if ( ! *dest_bytes )
+			break;
+	}
+	return dest;
+}
+
+CHAR16 * InternalStrCat ( CHAR16 *dest, const CHAR16 *src )
+{
+	InternalStrCpy ( ( dest + InternalStrLen ( dest ) ), src );
+	return dest;
+}
+
+CHAR16 * InternalStrnCpy ( CHAR16 *dest, const CHAR16 *src, UINT8 max )
+{
+	const UINT16 *src_bytes = ( ( const UINT16 * ) src );
+	UINT16 *dest_bytes = ( ( UINT16 * ) dest );
+
+	for ( ; max ; max--, src_bytes++, dest_bytes++ ) {
+		*dest_bytes = *src_bytes;
+		if ( ! *dest_bytes )
+			break;
+	}
+	while ( max-- )
+		*(dest_bytes++) = '\0';
+	return dest;
+}
+
+VOID
+EFIAPI
+CreatePopUp (
+  IN  UINTN          Attribute,
+  OUT EFI_INPUT_KEY  *Key,      OPTIONAL
+  ...
+  )
+{
+  EFI_STATUS                       Status;
+  VA_LIST                          Args;
+  EFI_BOOT_SERVICES                *gBS = efi_systab->BootServices;
+  EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL  *ConOut = efi_systab->ConOut;
+  EFI_SIMPLE_TEXT_INPUT_PROTOCOL   *ConIn = efi_systab->ConIn;
+  EFI_SIMPLE_TEXT_OUTPUT_MODE      SavedConsoleMode;
+  UINTN                            Columns;
+  UINTN                            Rows;
+  UINTN                            Column;
+  UINTN                            Row;
+  UINTN                            NumberOfLines;
+  UINTN                            MaxLength;
+  CHAR16                           *String;
+  UINTN                            Length;
+  CHAR16                           *Line = NULL;
+  UINTN                            EventIndex;
+
+  VA_START (Args, Key);
+  MaxLength = 0;
+  NumberOfLines = 0;
+  while ((String = VA_ARG (Args, CHAR16 *)) != NULL) {
+    MaxLength = MAX (MaxLength, InternalStrLen (String));
+    NumberOfLines++;
+  }
+  VA_END (Args);
+
+  gBS->CopyMem(&SavedConsoleMode,ConOut->Mode,sizeof (SavedConsoleMode));
+
+  ConOut->QueryMode (ConOut, SavedConsoleMode.Mode, &Columns, &Rows);
+
+  ConOut->EnableCursor (ConOut, FALSE);
+  ConOut->SetAttribute (ConOut, Attribute);
+
+  NumberOfLines = MIN (NumberOfLines, Rows - 3);
+
+  MaxLength = MIN (MaxLength, Columns - 2);
+
+  Row    = (Rows - (NumberOfLines + 3)) / 2;
+  Column = (Columns - (MaxLength + 2)) / 2;
+
+  gBS->AllocatePool ( EfiBootServicesData, (MaxLength + 3) * sizeof (CHAR16) ,(VOID **)&Line );
+
+  gBS->SetMem((UINT8 *)Line,(MaxLength + 3) * sizeof (CHAR16) ,0xAA);
+
+  InternalMemSetMem16 (Line, (MaxLength + 2), BOXDRAW_HORIZONTAL);
+
+  Line[0] = BOXDRAW_DOWN_RIGHT;
+  Line[MaxLength + 1] = BOXDRAW_DOWN_LEFT;
+  Line[MaxLength + 2] = L'\0';
+
+  ConOut->SetCursorPosition (ConOut, Column, Row++);
+  ConOut->OutputString (ConOut, Line);
+
+  // Draw middle of the popup with strings
+  //
+  VA_START (Args, Key);
+  while ((String = VA_ARG (Args, CHAR16 *)) != NULL && NumberOfLines > 0) {
+    Length = InternalStrLen (String);
+    InternalMemSetMem16 (Line, MaxLength + 2, L' ');
+    if (Length <= MaxLength) {
+      //
+      // Length <= MaxLength
+      //
+      gBS->CopyMem(Line + 1 + (MaxLength - Length) / 2, String, Length * sizeof (CHAR16));
+    } else {
+      //
+      // Length > MaxLength
+      //
+      gBS->CopyMem(Line + 1, String + (Length - MaxLength) / 2 ,MaxLength * sizeof (CHAR16));
+    }
+    Line[0]             = BOXDRAW_VERTICAL;
+    Line[MaxLength + 1] = BOXDRAW_VERTICAL;
+    Line[MaxLength + 2] = L'\0';
+    ConOut->SetCursorPosition (ConOut, Column, Row++);
+    ConOut->OutputString (ConOut, Line);
+    NumberOfLines--;
+  }
+  VA_END (Args);
+
+  //
+  // Draw bottom of popup box
+  //
+  InternalMemSetMem16 (Line, (MaxLength + 2), BOXDRAW_HORIZONTAL);
+  Line[0]             = BOXDRAW_UP_RIGHT;
+  Line[MaxLength + 1] = BOXDRAW_UP_LEFT;
+  Line[MaxLength + 2] = L'\0';
+  ConOut->SetCursorPosition (ConOut, Column, Row++);
+  ConOut->OutputString (ConOut, Line);
+
+  //
+  // Free the allocated line buffer
+  //
+  gBS->FreePool (Line);
+  ConOut->EnableCursor      (ConOut, SavedConsoleMode.CursorVisible);
+  ConOut->SetCursorPosition (ConOut, SavedConsoleMode.CursorColumn, SavedConsoleMode.CursorRow);
+  ConOut->SetAttribute      (ConOut, SavedConsoleMode.Attribute);
+
+  // Wait for a keystroke
+  //
+  if (Key != NULL) {
+    while (TRUE) {
+      Status = ConIn->ReadKeyStroke (ConIn, Key);
+      if (!EFI_ERROR (Status)) {
+        break;
+      }
+      if (Status != EFI_NOT_READY) {
+        continue;
+      }
+      gBS->WaitForEvent (1, &ConIn->WaitForKey, &EventIndex);
+    }
+  }
+}
+
+BOOLEAN
+EFIAPI
+HiiCreatePopUp (
+  IN  UINT8             PopupStyle,
+  IN  UINT8        		  PopupType,
+  IN  EFI_HII_HANDLE    HiiHandle,
+  IN  EFI_STRING_ID     Message
+)
+{
+  EFI_BOOT_SERVICES         *gBS = efi_systab->BootServices;
+  EFI_STATUS                Status;
+  EFI_HII_POPUP_PROTOCOL    *HiiPopupProtocol = NULL;
+  EFI_GUID                  EfiHiiPopupProtocolGuid = EFI_HII_POPUP_PROTOCOL_GUID;
+  EFI_INPUT_KEY             Key;
+  EFI_STRING                String;
+  UINT8                     StringLen;
+
+  Status = gBS->LocateProtocol (&EfiHiiPopupProtocolGuid, NULL, (VOID **) &HiiPopupProtocol);
+  if (EFI_ERROR (Status) || HiiPopupProtocol == NULL) {
+
+    String = HiiGetString(HiiHandle,Message,&StringLen,"English");
+
+    CreatePopUp (
+                EFI_LIGHTGRAY | EFI_BACKGROUND_BLUE,
+                &Key,
+                String,
+                NULL
+              );
+    return TRUE;
+  }
+
+  Status = HiiPopupProtocol->CreatePopup(HiiPopupProtocol, \
+                                          PopupStyle, \
+                                          PopupType, \
+                                          HiiHandle, \
+                                          Message, \
+                                          NULL);
+
+  if (EFI_ERROR (Status)) {
+      return FALSE;
+  }
+
+  return TRUE;
+}
+
+void efi_ifr_checkbox_op ( struct efi_ifr_builder *ifr,
+             unsigned int prompt_id,unsigned int help_id,
+             unsigned int question_id,
+             unsigned int varstore_id,
+             unsigned int varstore_info __unused,
+             unsigned int varstore_offset,
+             unsigned int vflags,
+             unsigned int flags ) {
+
+    EFI_IFR_CHECKBOX *OpCode;
+
+    /* Add opcode */
+    OpCode = efi_ifr_op ( ifr, EFI_IFR_CHECKBOX_OP, sizeof ( *OpCode ) );
+    if ( ! OpCode )
+        return;
+
+    OpCode->Question.QuestionId             = question_id;
+      OpCode->Question.VarStoreId             = varstore_id;
+      OpCode->Question.VarStoreInfo.VarOffset = varstore_offset;
+      OpCode->Question.Header.Prompt          = prompt_id;
+      OpCode->Question.Header.Help            = help_id;
+      OpCode->Question.Flags                  = vflags;
+      OpCode->Flags                           = flags;
+}
+
+void
+efi_ifr_oneofoption_op ( struct efi_ifr_builder *ifr,
+  IN UINT16  StringId,
+  IN UINT8   Flags,
+  IN UINT8   Type,
+  IN UINT64  Value
+  )
+{
+    EFI_IFR_ONE_OF_OPTION *OpCode;
+    EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
+    UINTN	ValueLen = mHiiDefaultTypeToWidth[Type];
+
+    /* Add opcode */
+    OpCode = efi_ifr_op ( ifr, EFI_IFR_ONE_OF_OPTION_OP, EFI_IFR_ONE_OF_OPTION_BASE_SIZE + ValueLen);
+    if ( ! OpCode )
+        return;
+
+    OpCode->Option = StringId;
+    OpCode->Flags = (UINT8) (Flags & (EFI_IFR_OPTION_DEFAULT | EFI_IFR_OPTION_DEFAULT_MFG));
+    OpCode->Type = Type;
+    bs->CopyMem(&OpCode->Value,&Value,ValueLen);
+}
+
+void
+efi_ifr_OneOf_Op (  struct efi_ifr_builder *ifr,
+  EFI_QUESTION_ID  QuestionId,
+  EFI_VARSTORE_ID  VarStoreId,
+  UINT16           VarInfo,
+  EFI_STRING_ID    Prompt,
+  EFI_STRING_ID    Help,
+  UINT8            QuestionFlags,
+  UINT8            OneOfFlags
+  )
+{
+    EFI_IFR_ONE_OF  *OpCode;
+
+    /* Add opcode */
+    OpCode = efi_ifr_op ( ifr, EFI_IFR_ONE_OF_OP, 17);
+    if ( ! OpCode )
+        return;
+
+    OpCode->Header.Scope = 1;
+      OpCode->Question.Header.Prompt          = Prompt;
+      OpCode->Question.Header.Help            = Help;
+      OpCode->Question.QuestionId             = QuestionId;
+      OpCode->Question.VarStoreId             = VarStoreId;
+      OpCode->Question.VarStoreInfo.VarOffset = VarInfo;
+      OpCode->Question.Flags                  = QuestionFlags;
+      OpCode->Flags                           = OneOfFlags;
+
+}
+
+EFI_STRING
+EFIAPI
+InternalHiiBrowserCallback (
+  IN CONST EFI_GUID    *VariableGuid,
+  IN CONST CHAR16      *VariableName,
+  IN CONST EFI_STRING  SetResultsData
+  )
+{
+  EFI_STATUS  Status;
+  UINTN       ResultsDataSize = 0;
+  EFI_STRING  ResultsData;
+  CHAR16      TempResultsData;
+  EFI_BOOT_SERVICES *gBS = efi_systab->BootServices;
+  EFI_GUID  gEfiFormBrowser2ProtocolGuid = EFI_FORM_BROWSER2_PROTOCOL_GUID;
+
+  if (mUefiFormBrowser2 == NULL) {
+    Status = gBS->LocateProtocol (&gEfiFormBrowser2ProtocolGuid, NULL, (VOID **) &mUefiFormBrowser2);
+    if (EFI_ERROR (Status) || mUefiFormBrowser2 == NULL) {
+      return NULL;
+    }
+  }
+
+  ResultsDataSize = 0;
+
+  if (SetResultsData != NULL) {
+    //
+    // Request to to set data in the uncommitted browser state information
+    //
+    ResultsData = SetResultsData;
+  } else {
+    //
+    // Retrieve the length of the buffer required ResultsData from the Browser Callback
+    //
+    Status = mUefiFormBrowser2->BrowserCallback (
+                              mUefiFormBrowser2,
+                              &ResultsDataSize,
+                              &TempResultsData,
+                              TRUE,
+                              VariableGuid,
+                              VariableName
+                              );
+
+    if (!EFI_ERROR (Status)) {
+      //
+      // No Resluts Data, only allocate one char for '\0'
+      //
+
+      gBS->AllocatePool ( EfiBootServicesData, sizeof (CHAR16) ,(VOID **)&ResultsData );
+      gBS->SetMem(ResultsData,sizeof (CHAR16),0);
+
+      return ResultsData;
+    }
+
+    if (Status != EFI_BUFFER_TOO_SMALL) {
+      return NULL;
+    }
+
+    gBS->AllocatePool ( EfiBootServicesData, ResultsDataSize ,(VOID **)&ResultsData );
+    gBS->SetMem(ResultsData,ResultsDataSize,0);
+
+    if (ResultsData == NULL) {
+      return NULL;
+    }
+  }
+
+  Status = mUefiFormBrowser2->BrowserCallback (
+                            mUefiFormBrowser2,
+                            &ResultsDataSize,
+                            ResultsData,
+                            (BOOLEAN)(SetResultsData == NULL),
+                            VariableGuid,
+                            VariableName
+                            );
+  if (EFI_ERROR (Status)) {
+    return NULL;
+  }
+
+  return ResultsData;
+}
+
+EFI_STRING
+EFIAPI
+InternalHiiBlockToConfig (
+  IN CONST EFI_STRING  ConfigRequest,
+  IN CONST UINT8       *Block,
+  IN UINTN             BlockSize
+  )
+{
+  EFI_STATUS  Status;
+  EFI_STRING  ConfigResp;
+  CHAR16      *Progress;
+  EFI_BOOT_SERVICES *gBS = efi_systab->BootServices;
+
+  if(gHiiConfigRouting == NULL){
+    Status = gBS->LocateProtocol (&gEfiHiiConfigRoutingProtocolGuid, NULL, (VOID **) &gHiiConfigRouting);
+  }
+
+  Status = gHiiConfigRouting->BlockToConfig (
+                                gHiiConfigRouting,
+                                ConfigRequest,
+                                Block,
+                                BlockSize,
+                                &ConfigResp,
+                                &Progress
+                                );
+
+  if (EFI_ERROR (Status)) {
+    return NULL;
+  }
+  return ConfigResp;
+}
+
+BOOLEAN
+EFIAPI
+HiiGetBrowserData (
+  IN CONST EFI_GUID  *VariableGuid,
+  IN CONST CHAR16    *VariableName,
+  IN UINTN           BufferSize,
+  OUT UINT8          *Buffer
+  )
+{
+  EFI_STRING  ResultsData;
+  UINTN       Size;
+  EFI_STRING  ConfigResp;
+  EFI_STATUS  Status;
+  CHAR16      *Progress;
+  EFI_BOOT_SERVICES *gBS = efi_systab->BootServices;
+
+  if(gHiiConfigRouting == NULL){
+    Status = gBS->LocateProtocol (&gEfiHiiConfigRoutingProtocolGuid, NULL, (VOID **) &gHiiConfigRouting);
+  }
+  //
+  // Retrieve the results data from the Browser Callback
+  //
+  ResultsData = InternalHiiBrowserCallback (VariableGuid, VariableName, NULL);
+
+  if (ResultsData == NULL) {
+    return FALSE;
+  }
+
+  Size = (InternalStrLen (mConfigHdrTemplate) + 1) * sizeof (CHAR16);
+  Size = Size + (InternalStrLen (ResultsData) + 1) * sizeof (CHAR16);
+
+  gBS->AllocatePool ( EfiBootServicesData, Size ,(VOID **)&ConfigResp );
+  gBS->SetMem(ConfigResp,Size,0);
+
+  efi_snprintf ( ConfigResp, Size,"%ls&%ls", mConfigHdrTemplate, ResultsData);
+
+  gBS->FreePool (ResultsData);
+
+  if (ConfigResp == NULL) {
+    return FALSE;
+  }
+
+  Status = gHiiConfigRouting->ConfigToBlock (
+                                gHiiConfigRouting,
+                                ConfigResp,
+                                Buffer,
+                                &BufferSize,
+                                &Progress
+                                );
+
+  gBS->FreePool (ConfigResp);
+
+  if (EFI_ERROR (Status)) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+BOOLEAN
+EFIAPI
+HiiSetBrowserData (
+  IN CONST EFI_GUID  *VariableGuid,
+  IN CONST CHAR16    *VariableName,
+  IN UINTN           BufferSize,
+  IN CONST UINT8     *Buffer
+  )
+{
+  UINTN       Size;
+  EFI_STRING  ConfigRequest;
+  EFI_STRING  ConfigResp;
+  EFI_STRING  ResultsData;
+  EFI_BOOT_SERVICES *gBS = efi_systab->BootServices;
+
+  Size = (InternalStrLen (mConfigHdrTemplate) + 32 + 1) * sizeof (CHAR16);
+
+  gBS->AllocatePool ( EfiBootServicesData, Size ,(VOID **)&ConfigRequest );
+  gBS->SetMem(ConfigRequest,Size,0);
+
+  efi_snprintf ( ConfigRequest, Size,"%ls&OFFSET=0&WIDTH=%x", mConfigHdrTemplate, BufferSize);
+
+  if (ConfigRequest == NULL) {
+    return FALSE;
+  }
+
+  ConfigResp = InternalHiiBlockToConfig (ConfigRequest, Buffer, BufferSize);
+
+  gBS->FreePool (ConfigRequest);
+  if (ConfigResp == NULL) {
+    return FALSE;
+  }
+
+  ResultsData = InternalHiiBrowserCallback (VariableGuid, VariableName, ConfigResp + InternalStrLen(mConfigHdrTemplate) + 1);
+
+  gBS->FreePool (ConfigResp);
+
+  return (BOOLEAN)(ResultsData != NULL);
+}
+
+void efi_ifr_suppress_grayout_op ( struct efi_ifr_builder *ifr,
+                              UINT16 		QuestionId,
+                              UINT16 		Value,
+                              BOOLEAN     Suppress    //if TRUE Suppress; False Gray out.
+) {
+
+    EFI_IFR_OP_HEADER   *OpCode;
+    EFI_IFR_EQ_ID_VAL   *Condition;
+
+    /* Add opcode */
+    if(Suppress) {
+        OpCode = efi_ifr_op ( ifr, EFI_IFR_SUPPRESS_IF_OP, sizeof ( *OpCode ) );
+    } else {
+        OpCode = efi_ifr_op ( ifr, EFI_IFR_GRAY_OUT_IF_OP, sizeof ( *OpCode ) );
+    }
+    if ( ! OpCode )
+        return;
+
+    OpCode->Scope = 1;
+
+    Condition = efi_ifr_op ( ifr, EFI_IFR_EQ_ID_VAL_OP, sizeof ( *Condition ) );
+
+    if ( ! Condition )
+        return;
+
+    Condition->Header.Scope = 0;
+
+    //Then goes Opcode Data..
+    Condition->QuestionId = QuestionId;
+    Condition->Value = Value;
+}
+
+
+/**
+ * Add EFI_IFR_REF_OP
+ *
+ * @v ifr           IFR builder
+ * @v form_id       Title string identifier
+ * @v Promt         String ID for Promt
+ * @v Help          String ID for Help
+ * @v QuestionFlags Flags in Question Header
+ * @v QuestionID    Question ID
+ * @ret A pointer tp tje created opcode.
+ */
+void efi_ifr_goto_op ( struct efi_ifr_builder *ifr,
+                   unsigned int form_id,
+                   unsigned int Promt,
+                   unsigned int Help,
+                   unsigned int QuestionFlags,
+                   unsigned int QuestionId ) {
+
+
+    EFI_IFR_REF *OpCode;
+
+    /* Add opcode */
+    OpCode = efi_ifr_op ( ifr, EFI_IFR_REF_OP, sizeof ( *OpCode ) );
+    if ( ! OpCode )
+        return;
+
+    OpCode->Question.Header.Prompt = Promt;
+    OpCode->Question.Header.Help = Help;
+    OpCode->Question.QuestionId = QuestionId;
+    OpCode->Question.Flags = QuestionFlags;
+    OpCode->Question.VarStoreId = 0;
+    OpCode->Question.VarStoreInfo.VarOffset = 0xFFFF;
+    OpCode->FormId = form_id;
+}
 
 /**
  * Add string to IFR builder
@@ -88,6 +1097,60 @@ unsigned int efi_ifr_string ( struct efi_ifr_builder *ifr, const char *fmt,
 }
 
 /**
+ * Add string to IFR builder
+ *
+ * @v ifr		IFR builder
+ * @v fmt		Format string
+ * @v ...		Arguments
+ * @ret string_id	String identifier, or zero on failure
+ */
+unsigned int efi_ifr_string_xuefi ( struct efi_ifr_builder *ifr,EFI_STRING_ID prompt_id, const char *fmt,
+                  ... ) {
+    EFI_HII_STRING_BLOCK *new_strings;
+    EFI_HII_XUEFI_BLOCK *xuefi;
+    EFI_HII_SIBT_SKIP2_BLOCK  *skip2;
+    EFI_HII_SIBT_STRING_UCS2_BLOCK *ucs2;
+    size_t new_strings_len;
+    va_list args;
+    size_t len;
+    unsigned int string_id;
+
+    if ( ifr->failed )
+        return 0;
+
+    va_start ( args, fmt );
+    len = ( efi_vsnprintf ( NULL, 0, fmt, args ) + 1 );
+    va_end ( args );
+
+    new_strings_len = ( ifr->uefi_strings_len + offsetof ( typeof ( *ucs2 ), StringText ) + ( len * sizeof ( ucs2->StringText[0] ) ) + sizeof( *skip2) );
+
+    new_strings = realloc ( ifr->uefi_strings, new_strings_len );
+
+    if ( ! new_strings ) {
+    ifr->failed = 1;
+    return 0;
+    }
+
+    // fill skip2
+    xuefi = ( ( ( void * ) new_strings ) + ifr->uefi_strings_len );
+    xuefi->skip2.Header.BlockType = EFI_HII_SIBT_SKIP2;
+    xuefi->skip2.SkipCount =  ifr->string_id - ifr->uefi_string_index - 1;
+
+    // fill ucs2
+    xuefi->ucs2.Header.BlockType = EFI_HII_SIBT_STRING_UCS2;
+
+    va_start ( args, fmt );
+    efi_vsnprintf ( xuefi->ucs2.StringText, len, fmt, args );
+    va_end ( args );
+
+    ifr->uefi_strings = new_strings;
+    ifr->uefi_strings_len = new_strings_len;
+    ifr->uefi_string_index = prompt_id;
+
+    return string_id;
+}
+
+/**
  * Add IFR opcode to IFR builder
  *
  * @v ifr		IFR builder
@@ -97,6 +1160,7 @@ unsigned int efi_ifr_string ( struct efi_ifr_builder *ifr, const char *fmt,
  */
 static void * efi_ifr_op ( struct efi_ifr_builder *ifr, unsigned int opcode,
 			   size_t len ) {
+
 	EFI_IFR_OP_HEADER *new_ops;
 	EFI_IFR_OP_HEADER *op;
 	size_t new_ops_len;
@@ -180,6 +1244,22 @@ unsigned int efi_ifr_form_op ( struct efi_ifr_builder *ifr,
 	       ifr, form->FormId, title_id );
 	DBGC2_HDA ( ifr, dispaddr, form, sizeof ( *form ) );
 	return form->FormId;
+}
+
+unsigned int efi_ifr_form_op_ex ( struct efi_ifr_builder *ifr,
+                   unsigned int form_id,
+                   unsigned int title_id ) {
+    EFI_IFR_FORM *form;
+
+    /* Add opcode */
+    form = efi_ifr_op ( ifr, EFI_IFR_FORM_OP, sizeof ( *form ) );
+    if ( ! form )
+        return 0;
+    form->Header.Scope = 1;
+    form->FormId = form_id;
+    form->FormTitle = title_id;
+
+    return form->FormId;
 }
 
 /**
@@ -325,21 +1405,33 @@ void efi_ifr_numeric_op ( struct efi_ifr_builder *ifr, unsigned int prompt_id,
 			  unsigned int vflags, unsigned long min_value,
 			  unsigned long max_value, unsigned int step,
 			  unsigned int flags ) {
+
 	size_t dispaddr = ifr->ops_len;
 	EFI_IFR_NUMERIC *numeric;
+	EFI_IFR_NUMERIC_BASE *Base;
 	unsigned int size;
+	UINTN	ValueLen;
+
+	ValueLen = mNumericDefaultTypeToWidth[flags & EFI_IFR_NUMERIC_SIZE];
 
 	/* Add opcode */
-	numeric = efi_ifr_op ( ifr, EFI_IFR_NUMERIC_OP, sizeof ( *numeric ) );
+	numeric = efi_ifr_op ( ifr, EFI_IFR_NUMERIC_OP, sizeof ( *Base )+ ValueLen);
+
 	if ( ! numeric )
 		return;
+
+	numeric->Header.Scope = 1;
+
 	numeric->Question.Header.Prompt = prompt_id;
 	numeric->Question.Header.Help = help_id;
 	numeric->Question.QuestionId = question_id;
 	numeric->Question.VarStoreId = varstore_id;
-	numeric->Question.VarStoreInfo.VarName = varstore_info;
+	numeric->Question.VarStoreInfo.VarOffset = varstore_info;
 	numeric->Question.Flags = vflags;
+	numeric->Flags = flags;
+
 	size = ( flags & EFI_IFR_NUMERIC_SIZE );
+
 	switch ( size ) {
 	case EFI_IFR_NUMERIC_SIZE_1 :
 		numeric->data.u8.MinValue = min_value;
@@ -399,7 +1491,7 @@ void efi_ifr_string_op ( struct efi_ifr_builder *ifr, unsigned int prompt_id,
 	string->Question.Header.Help = help_id;
 	string->Question.QuestionId = question_id;
 	string->Question.VarStoreId = varstore_id;
-	string->Question.VarStoreInfo.VarName = varstore_info;
+	string->Question.VarStoreInfo.VarOffset = varstore_info;
 	string->Question.Flags = vflags;
 	string->MinSize = min_size;
 	string->MaxSize = max_size;
@@ -471,6 +1563,30 @@ void efi_ifr_true_op ( struct efi_ifr_builder *ifr ) {
 	DBGC2_HDA ( ifr, dispaddr, true, sizeof ( *true ) );
 }
 
+unsigned int efi_ifr_varstore_op ( struct efi_ifr_builder *ifr,
+                          const EFI_GUID *guid,
+                          UINT16 size,
+                          const char *name ) {
+
+    UINT8	length;
+    EFI_IFR_VARSTORE *varstore;
+
+    length = strlen(&name[0]);
+    length += sizeof ( *varstore );
+
+    /* Add opcode */
+    varstore = efi_ifr_op ( ifr, EFI_IFR_VARSTORE_OP,length );
+
+    if ( ! varstore )
+        return 0;
+
+    varstore->VarStoreId = ++(ifr->varstore_id);
+    memcpy ( &varstore->Guid, guid, sizeof ( varstore->Guid ) );
+    varstore->Size = size;
+    strcpy((char *)varstore->Name,name);
+    return varstore->VarStoreId;
+}
+
 /**
  * Add name/value store opcode to IFR builder
  *
@@ -507,6 +1623,101 @@ void efi_ifr_free ( struct efi_ifr_builder *ifr ) {
 	free ( ifr->ops );
 	free ( ifr->strings );
 	memset ( ifr, 0, sizeof ( *ifr ) );
+}
+
+/**
+ * Construct package list from IFR builder
+ *
+ * @v ifr		IFR builder
+ * @v guid		Package GUID
+ * @v language		Language
+ * @v language_id	Language string ID
+ * @ret package		Package list, or NULL
+ *
+ * The package list is allocated using malloc(), and must eventually
+ * be freed by the caller.  (The caller must also call efi_ifr_free()
+ * to free the temporary storage used during construction.)
+ */
+EFI_HII_PACKAGE_LIST_HEADER * efi_ifr_package_ex (
+  struct efi_ifr_builder *ifr,
+  const EFI_GUID *guid,
+  const char *language_eng,
+  unsigned int language_eng_id,
+  const char *language_uefi,    OPTIONAL
+  unsigned int language_uefi_id OPTIONAL
+)
+{
+
+    struct {
+        EFI_HII_PACKAGE_LIST_HEADER header;
+        struct {
+            EFI_HII_PACKAGE_HEADER header;
+            uint8_t data[ifr->ops_len];
+        } __attribute__ (( packed )) ops;
+        struct {
+            union {
+                EFI_HII_STRING_PACKAGE_HDR header;
+                uint8_t pad[ offsetof(EFI_HII_STRING_PACKAGE_HDR,Language) + strlen ( language_eng ) + 1 /* NUL */ ];
+            } __attribute__ (( packed )) header;
+            uint8_t data[ifr->strings_len];
+            EFI_HII_STRING_BLOCK end;
+        } __attribute__ (( packed )) strings_eng;
+#ifdef XUEFI_LANG_SUPPORT
+        struct {
+            union {
+                EFI_HII_STRING_PACKAGE_HDR header;
+                uint8_t pad[offsetof(EFI_HII_STRING_PACKAGE_HDR,Language) + strlen ( language_uefi ) + 1 /* NUL */ ];
+            } __attribute__ (( packed )) header;
+            uint8_t data[ifr->uefi_strings_len];
+            EFI_HII_STRING_BLOCK end;
+        } __attribute__ (( packed )) strings_uefi;
+#endif
+        EFI_HII_PACKAGE_HEADER end;
+    } __attribute__ (( packed )) *package;
+
+    /* Fail if any previous allocation failed */
+    if ( ifr->failed )
+        return NULL;
+
+    /* Allocate package list */
+    package = zalloc ( sizeof ( *package ) );
+    if ( ! package )
+        return NULL;
+
+    /* Populate package list */
+    package->header.PackageLength = sizeof ( *package );
+    memcpy ( &package->header.PackageListGuid, guid,sizeof ( package->header.PackageListGuid ) );
+
+    package->ops.header.Length = sizeof ( package->ops );
+    package->ops.header.Type = EFI_HII_PACKAGE_FORMS;
+    memcpy ( package->ops.data, ifr->ops, sizeof ( package->ops.data ) );
+
+    // English String Package
+    package->strings_eng.header.header.Header.Length = sizeof ( package->strings_eng );
+    package->strings_eng.header.header.Header.Type = EFI_HII_PACKAGE_STRINGS;
+    package->strings_eng.header.header.HdrSize = sizeof ( package->strings_eng.header );
+    package->strings_eng.header.header.StringInfoOffset = sizeof ( package->strings_eng.header );
+    package->strings_eng.header.header.LanguageName = language_eng_id;
+    strcpy ( package->strings_eng.header.header.Language, language_eng );
+    memcpy ( package->strings_eng.data, ifr->strings,sizeof ( package->strings_eng.data ) );
+    package->strings_eng.end.BlockType = EFI_HII_SIBT_END;
+
+    // x-UEFI String Package
+#ifdef XUEFI_LANG_SUPPORT
+    package->strings_uefi.header.header.Header.Length = sizeof ( package->strings_uefi );
+    package->strings_uefi.header.header.Header.Type = EFI_HII_PACKAGE_STRINGS;
+    package->strings_uefi.header.header.HdrSize = sizeof ( package->strings_uefi.header );
+    package->strings_uefi.header.header.StringInfoOffset = sizeof ( package->strings_uefi.header );
+    package->strings_uefi.header.header.LanguageName = language_uefi_id;
+    strcpy ( package->strings_uefi.header.header.Language, language_uefi );
+    memcpy ( package->strings_uefi.data, ifr->uefi_strings,sizeof ( package->strings_uefi.data ) );
+    package->strings_uefi.end.BlockType = EFI_HII_SIBT_END;
+#endif
+
+    package->end.Type = EFI_HII_PACKAGE_END;
+    package->end.Length = sizeof ( package->end );
+
+    return &package->header;
 }
 
 /**

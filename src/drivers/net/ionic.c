@@ -16,9 +16,11 @@
  *
  */
 
+#include "ipxe/iobuf.h"
 FILE_LICENCE(GPL2_OR_LATER_OR_UBDL);
 
 #include "ionic.h"
+
 
 /** @file
  *
@@ -88,6 +90,15 @@ int ionic_check_link ( struct net_device *netdev )
 	}
 	return 0;
 }
+
+void ionic_qcqs_rxtx_dealloc(struct lif *lif)
+{
+	ionic_qcq_dealloc(lif->txqcqs);
+	lif->txqcqs = NULL;
+	ionic_qcq_dealloc(lif->rxqcqs);
+	lif->rxqcqs = NULL;
+}
+
 /******************************************************************************
  *
  * Network device interface
@@ -118,32 +129,24 @@ int ionic_start_queues(struct ionic *ionic)
 	// skip any old events
 	ionic_drain_notifyq(ionic);
 
-	err = ionic_lif_txq_init(ionic->lif, ionic->lif->txqcqs);
-	if (err) {
-		DBG_OPROM_ERR(ionic, "failed to initialize the txq: %d\n", err);
-		return err;
-	}
-
-	err = ionic_lif_rxq_init(ionic->lif, ionic->lif->rxqcqs);
-	if (err) {
-		DBG_OPROM_ERR(ionic, "failed to initialize the rxq: %d\n", err);
-		return err;
-	}
-
 	err = ionic_qcq_enable(ionic->lif->txqcqs);
-	if (err)
+	if (err) {
+		DBG_OPROM_ERR(ionic, "ionic_qcq_enable failed for TX\n");
 		return err;
+	}
 
 	err = ionic_lif_rx_mode(ionic->lif, IONIC_RX_MODE_F_UNICAST
 								| IONIC_RX_MODE_F_MULTICAST
 								| IONIC_RX_MODE_F_BROADCAST
 								| IONIC_RX_MODE_F_ALLMULTI);
 	if (err)
-		return err;
+		goto err_tx_qcq_enable;
 
 	err = ionic_qcq_enable(ionic->lif->rxqcqs);
-	if (err)
-		return err;
+	if (err) {
+		DBG_OPROM_ERR(ionic, "ionic_qcq_enable failed for RX\n");
+		goto err_tx_qcq_enable;
+	}
 
 	/* do this before filling ring */
 	ionic->qs_running = 1;
@@ -153,8 +156,31 @@ int ionic_start_queues(struct ionic *ionic)
 	ionic_rx_fill(ionic->netdev, mtu);
 
 	return 0;
+err_tx_qcq_enable:
+	ionic_qcq_disable(ionic->lif->txqcqs);
+	return err;
 }
 
+static void ionic_lif_rxtx_deinit(struct ionic *ionic)
+{
+	if (ionic->qs_running) {
+		DBG_OPROM_ERR(ionic, "queues are not stopped - "
+                      "abort ionic_lif_rxtx_deinit\n");
+		return;
+	}
+	// setting QCQ_F_INITED flag to 0.
+	ionic_lif_queue_deinit(ionic);
+
+	ionic_tx_flush(ionic->netdev, ionic->lif);
+
+	ionic_rx_flush(ionic->lif);
+
+	ionic_qcqs_rxtx_dealloc(ionic->lif);
+}
+
+static bool ionic_is_link_up (struct ionic *ionic) {
+	return (ionic->lif->info->status.link_status == IONIC_PORT_OPER_STATUS_UP);
+}
 
 /**
  * Open network device
@@ -167,21 +193,36 @@ static int ionic_open(struct net_device *netdev)
 	struct ionic *ionic = netdev->priv;
 	int err;
 
-	DBG_OPROM_INFO(ionic, "\n");
+	DBG_OPROM_INFO(ionic, "MTU Size :%ld\n", netdev->mtu);
 
 	err = ionic_start_device(ionic);
 	if (err)
 		return err;
 
-	err = ionic_start_queues(ionic);
+	err = ionic_lif_rxtx_init(ionic);
 	if (err) {
-		ionic_stop_device(ionic);
-		return err;
+		DBG_OPROM_ERR(ionic, "Cannot initiate LIFs: %d for rxq,txq, aborting\n",
+                      err);
+		goto err_start_device;
+	}
+
+	if (ionic_is_link_up(ionic)) {
+		err = ionic_start_queues(ionic);
+		if (err)
+			goto err_lif_rxtx_init;
+	} else {
+		DBG_OPROM_INFO(ionic, "Link is down-skipping ionic_start_queues\n");
 	}
 
 	ionic_check_link(netdev);
-
 	return 0;
+
+err_lif_rxtx_init:
+	ionic_lif_rxtx_deinit(ionic);
+err_start_device:
+	ionic_stop_device(ionic);
+
+	return err;
 }
 
 /**
@@ -197,9 +238,6 @@ void ionic_stop_queues(struct ionic *ionic)
 	}
 	ionic->qs_running = 0;
 
-	// setting QCQ_F_INITED flag to 0.
-	ionic_lif_queue_deinit(ionic);
-
 	if (ionic_qcq_disable(ionic->lif->rxqcqs))
 		DBG_OPROM_ERR(ionic, "Unable to disable rxqcq\n");
 
@@ -209,9 +247,6 @@ void ionic_stop_queues(struct ionic *ionic)
 	if (ionic_lif_quiesce(ionic->lif))
 		DBG_OPROM_ERR(ionic, "Unable to quiesce lif\n");
 
-	ionic_tx_flush(ionic->netdev, ionic->lif);
-
-	ionic_rx_flush(ionic->lif);
 }
 
 /**
@@ -235,11 +270,17 @@ static void ionic_close(struct net_device *netdev)
 		stats->tx_done.cnt, stats->tx_full.cnt,
 		stats->tx_comp_index.cnt, ionic_q_space_avail(txq));
 	DBG_OPROM_INFO(ionic, "rx_done_cnt: %lld rx_doorbell_cnt: %lld "
-		"rx_alloc_fail_cnt: %lld  rx_desc_avail: %d\n",
+		"rx_alloc_fail_cnt: %lld rx_desc_avail: %d\n",
 		stats->rx_done.cnt, stats->rx_doorbell.cnt,
 		stats->rx_alloc_fail.cnt, ionic_q_space_avail(rxq));
+	DBG_OPROM_INFO(ionic, "MTU size :%ld\n", netdev->mtu);
 
-	ionic_stop_queues(ionic);
+	if (ionic_is_link_up(ionic)) {
+		ionic_stop_queues(ionic);
+	} else {
+		DBG_OPROM_INFO(ionic, "Link is down-skipping ionic_stop_queues\n");
+	}
+	ionic_lif_rxtx_deinit(ionic);
 	ionic_stop_device(ionic);
 }
 
@@ -265,6 +306,11 @@ static int ionic_transmit(struct net_device *netdev,
 		return -ENOBUFS;
 	}
 
+	if (iob_map_tx(iobuf, &ionic->pdev->dma)) {
+		stats->tx_map_err.cnt++;
+		return -EIO;
+	}
+
 	// fill the descriptor
 	if (ionic->lif->vlan_en) {
 		flags = IONIC_TXQ_DESC_FLAG_VLAN;
@@ -276,7 +322,7 @@ static int ionic_transmit(struct net_device *netdev,
 	desc->hword1 = 0;
 	desc->hword2 = 0;
 	desc->cmd = encode_txq_desc_cmd(IONIC_TXQ_DESC_OPCODE_CSUM_NONE,
-					flags, 0, virt_to_bus(iobuf->data));
+					flags, 0, iob_dma(iobuf));
 
 	// store the iobuf in the txq
 	txq->lif->tx_iobuf[txq->head->index] = iobuf;
@@ -434,10 +480,6 @@ void ionic_stop_device(struct ionic *ionic)
 	ionic->lif->adminqcq = NULL;
 	ionic_qcq_dealloc(ionic->lif->notifyqcqs);
 	ionic->lif->notifyqcqs = NULL;
-	ionic_qcq_dealloc(ionic->lif->txqcqs);
-	ionic->lif->txqcqs = NULL;
-	ionic_qcq_dealloc(ionic->lif->rxqcqs);
-	ionic->lif->rxqcqs = NULL;
 	free_phys(ionic->lif->info, ionic->lif->info_sz);
 
 	// Reset lif
@@ -468,8 +510,10 @@ int ionic_start_device(struct ionic *ionic)
 	ionic->fw_running = 1;
 
 	// Init the NIC
-	if ((errorcode = ionic_init(ionic)) != 0)
+	if ((errorcode = ionic_init(ionic)) != 0) {
+		DBG_OPROM_ERR(ionic, "Failed in ionic_init\n");
 		goto err_out;
+	}
 
 	// Identify the Ionic
 	errorcode = ionic_identify(ionic);
@@ -494,7 +538,7 @@ int ionic_start_device(struct ionic *ionic)
 	errorcode = ionic_debug_stats_init(ionic);
 	if (errorcode) {
 		DBG_OPROM_ERR(ionic,
-                      "Failed to initialize debug_stats-check the fw version\n");
+			"Failed to initialize debug_stats-check the fw version\n");
 	}
 
 	return 0;
@@ -504,10 +548,6 @@ err_alloc:
 	ionic->lif->adminqcq = NULL;
 	ionic_qcq_dealloc(ionic->lif->notifyqcqs);
 	ionic->lif->notifyqcqs = NULL;
-	ionic_qcq_dealloc(ionic->lif->txqcqs);
-	ionic->lif->txqcqs = NULL;
-	ionic_qcq_dealloc(ionic->lif->rxqcqs);
-	ionic->lif->rxqcqs = NULL;
 	free_phys(ionic->lif->info, sizeof(ionic->lif->info_sz));
 	free(ionic->lif);
 err_reset:
@@ -527,31 +567,64 @@ void ionic_handle_fw_down(struct ionic *ionic)
 {
 	DBG_OPROM_INFO(ionic, "\n");
 
-	// Stop the queues
 	netdev_link_down(ionic->netdev);
-	if (netdev_is_open(ionic->netdev))
+
+	if (ionic_is_link_up(ionic)) {
+		// Stop the queues
 		ionic_stop_queues(ionic);
+	}
+	if (netdev_is_open(ionic->netdev)) {
+		ionic_lif_rxtx_deinit(ionic);
+	}
 
 	// Stop the device
 	ionic_stop_device(ionic);
 }
+
 
 /**
  * Restart the queues after FW comes back up
  */
 void ionic_handle_fw_up(struct ionic *ionic)
 {
+	int err;
+
 	DBG_OPROM_INFO(ionic, "\n");
 
 	// Get the device running
-	if (ionic_start_device(ionic) != 0)
+	if (ionic_start_device(ionic) != 0) {
+		DBG_OPROM_ERR(ionic, "Failed in ionic_start_device\n");
 		return;
+	}
 
 	// Get the Tx/Rx queues running
-	if (netdev_is_open(ionic->netdev))
-		ionic_start_queues(ionic);
+	if (netdev_is_open(ionic->netdev)) {
+		err = ionic_lif_rxtx_init(ionic);
+		if (err) {
+			DBG_OPROM_ERR(ionic, "Failed in ionic_lif_rxtx_init :%d\n",
+			  err);
+			goto err_start_device;
+		}
+
+		if (ionic_is_link_up(ionic)) {
+			err = ionic_start_queues(ionic);
+			if (err) {
+				DBG_OPROM_ERR(ionic, "Failed in ionic_start_queue :%d\n",
+				  err);
+				goto err_lif_rxtx_init;
+			}
+		} else {
+			DBG_OPROM_INFO(ionic, "Link is down-skipping ionic_start_queues\n");
+		}
+	}
 
 	ionic_check_link(ionic->netdev);
+	return;
+err_lif_rxtx_init:
+	ionic_lif_rxtx_deinit(ionic);
+err_start_device:
+	ionic_stop_device(ionic);
+	return;
 }
 
 /**
@@ -565,11 +638,20 @@ static int ionic_probe(struct pci_device *pci)
 	struct net_device *netdev; // network device information.
 	struct ionic *ionic = NULL;	   // ionic device information.
 	int errorcode;
+#ifdef PEN_IONIC_EFIROM
+	uint16_t vendorid, deviceid;
 	uint32_t rom_base_addr;
 
-	// Return if no opt ROM configured for this dev
-	pci_read_config_dword ( pci, PCI_ROM_ADDRESS, &rom_base_addr);
-	if (!rom_base_addr) {
+	/*
+	 * Skip this device if it is an Ethernet PF device
+	 * and the option rom base address is not configured.
+	 */
+	pci_read_config_word(pci, PCI_VENDOR_ID, &vendorid);
+	pci_read_config_word(pci, PCI_DEVICE_ID, &deviceid);
+	pci_read_config_dword(pci, PCI_ROM_ADDRESS, &rom_base_addr);
+	if (vendorid == PCI_VENDOR_ID_PENSANDO &&
+		deviceid == PCI_DEVICE_ID_PENSANDO_ENET &&
+		!rom_base_addr) {
 		pci_write_config_dword(pci, PCI_ROM_ADDRESS, 0xfffff800);
 		pci_read_config_dword(pci, PCI_ROM_ADDRESS, &rom_base_addr);
 		pci_write_config_dword(pci, PCI_ROM_ADDRESS, 0);
@@ -578,7 +660,7 @@ static int ionic_probe(struct pci_device *pci)
 			return -ENODEV;
 		}
 	}
-
+#endif
 	// Allocate and initialise net device
 	netdev = alloc_etherdev(sizeof(*ionic));
 	if (!netdev) {
@@ -620,6 +702,7 @@ static int ionic_probe(struct pci_device *pci)
 		DBG_OPROM_ERR(ionic, "Cannot allocate debug_stats region\n");
 		goto err_debug_stats_alloc;
 	}
+	netdev->max_pkt_len = IONIC_MAX_PKT_LEN;
 
 	errorcode = ionic_start_device(ionic);
 	if (errorcode) {
@@ -634,8 +717,9 @@ static int ionic_probe(struct pci_device *pci)
 		goto err_register_netdev;
 
 	ionic_checkpoint_cb(netdev, IONIC_OPROM_REGISTER_NETDEV_DONE);
-	DBG_OPROM_INFO(ionic, "%s: Ionic oprom NETDEV Register done\n",
-			ionic->netdev->name);
+	DBG_OPROM_INFO(ionic, "%s: Ionic oprom NETDEV Register done-"
+			"Max Packet Len:%ld MTU Size:%ld\n",
+			ionic->netdev->name, netdev->max_pkt_len, netdev->mtu);
 
 	return 0;
 

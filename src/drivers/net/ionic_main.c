@@ -17,6 +17,10 @@
  */
 
 #include "ionic.h"
+#include "ipxe/dma.h"
+#include "ipxe/iobuf.h"
+#include "ipxe/pci.h"
+#include "ipxe/uaccess.h"
 
 /* Find last set bit; fls(0) = 0, fls(1) = 1, fls(0x80000000) = 32 */
 static int fls(int x)
@@ -321,6 +325,7 @@ int ionic_dev_setup(struct ionic_dev *idev, struct ionic_device_bar bars[],
 	u32 sig;
 	u8 oprom_debug_flag = 0;
 	struct ionic *ionic = container_of(idev, struct ionic, idev);
+	char fw_version[IONIC_DEVINFO_FWVERS_BUFLEN];
 
 	// BAR0 resources
 	if (num_bars < 1 || bar->len != IONIC_BAR0_SIZE) {
@@ -345,6 +350,13 @@ int ionic_dev_setup(struct ionic_dev *idev, struct ionic_device_bar bars[],
 		ionic->oprom_debug_enable = 1;
 		DBG_OPROM_INFO(ionic, "******** OPROM DEBUG LOGS START PRINT ********\n");
 	}
+
+	memcpy(fw_version,
+		&idev->dev_info->fw_version[0],
+		IONIC_DEVINFO_FWVERS_BUFLEN);
+	fw_version[IONIC_DEVINFO_FWVERS_BUFLEN-1] = '\0';
+	DBG_OPROM_INFO(ionic,
+		"FW Version: %s\n", fw_version);
 
 	// BAR1 resources
 	bar++;
@@ -388,6 +400,7 @@ int ionic_setup(struct ionic *ionic)
 
 	err = ionic_dev_setup(&ionic->idev, ionic->bars, ionic->num_bars);
 	if (err) {
+		DBG_OPROM_ERR(ionic, "Failed in ionic_dev_setup\n");
 		return err;
 	}
 
@@ -573,6 +586,7 @@ static int ionic_qcq_alloc(struct lif *lif, unsigned int type,
 			   unsigned int align_sz)
 {
 	struct ionic_dev *idev = &lif->ionic->idev;
+	struct ionic *ionic = lif->ionic;
 	struct qcq *new;
 	unsigned int q_size = num_descs * desc_size;
 	unsigned int cq_size = num_descs * cq_desc_size;
@@ -586,14 +600,17 @@ static int ionic_qcq_alloc(struct lif *lif, unsigned int type,
 	total_size = ALIGN(q_size, align_sz) + ALIGN(cq_size, align_sz);
 
 	new = zalloc(sizeof(*new));
-	if (!new)
+	if (!new) {
+		DBG_OPROM_ERR(ionic, "zalloc failed in ionic_qcq_alloc\n");
 		return -ENOMEM;
+	}
 
 	new->flags = flags;
 
 	new->q.info = zalloc(sizeof(*new->q.info) * num_descs);
 	if (!new->q.info) {
 		err = -ENOMEM;
+		DBG_OPROM_ERR(ionic, "zalloc failed in ionic_qcq_alloc for new->q.info\n");
 		goto err_free_new_qcq;
 	}
 
@@ -602,24 +619,30 @@ static int ionic_qcq_alloc(struct lif *lif, unsigned int type,
 	err = ionic_q_init(lif, idev, &new->q, index, num_descs,
 					   desc_size, pid);
 	if (err) {
+		DBG_OPROM_ERR(ionic, "ionic_q_init failed num_descs:%d desc_size:%d\n",
+			      num_descs, desc_size);
 		err = -ENOMEM;
 		goto err_free_q_info;
 	}
 
 	new->cq.info = zalloc(sizeof(*new->cq.info) * num_descs);
 	if (!new->cq.info) {
+		DBG_OPROM_ERR(ionic, "zalloc failed in ionic_qcq_alloc for new->cq.info\n");
 		err = -ENOMEM;
 		goto err_free_q_info;
 	}
 
 	err = ionic_cq_init(lif, &new->cq, num_descs, cq_desc_size);
 	if (err) {
+		DBG_OPROM_ERR(ionic, "ionic_cq_init failed num_descs:%d desc_size:%d\n",
+			      num_descs, cq_desc_size);
 		err = -ENOMEM;
 		goto err_free_cq_info;
 	}
 
 	new->base = malloc_phys(total_size, align_sz);
 	if (!new->base) {
+		DBG_OPROM_ERR(ionic, "malloc_phys failed in ionic_qcq_alloc for new->base\n");
 		err = -ENOMEM;
 		goto err_free_cq_info;
 	}
@@ -664,11 +687,64 @@ void ionic_qcq_dealloc(struct qcq *qcq)
 	free(qcq);
 }
 
-/**
- * Allocate the adminq, txq and rxq.
- * */
-static int ionic_qcqs_alloc(struct lif *lif)
+static
+unsigned int ionic_rxq_ring_size(unsigned int mtu)
 {
+	if (mtu > 1500)
+		return JUMBO_FRAMES_NRXQ_DESC;
+	else
+		return NRXQ_DESC;
+}
+
+/**
+ * Allocate the txq and rxq.
+ * */
+static int ionic_qcqs_rxtx_alloc(struct lif *lif)
+{
+	struct ionic *ionic = lif->ionic;
+	unsigned int flags;
+	unsigned int pid;
+	int err = -ENOMEM;
+
+	pid = 0;
+	flags = 0;
+
+	flags = QCQ_F_TX_STATS;
+	err = ionic_qcq_alloc(lif, IONIC_QTYPE_TXQ, 0, flags,
+			      NTXQ_DESC,
+			      sizeof(struct ionic_txq_desc),
+			      sizeof(struct ionic_txq_comp),
+			      pid, &lif->txqcqs, IONIC_ALIGN_SZ);
+	if (err) {
+		DBG_OPROM_ERR(ionic, "Failed in ionic_qcq_alloc for TX\n");
+		goto err_free_txqcq;
+	}
+
+	flags = QCQ_F_RX_STATS;
+	err = ionic_qcq_alloc(lif, IONIC_QTYPE_RXQ, 0, flags,
+			      ionic_rxq_ring_size(lif->ionic->netdev->mtu),
+			      sizeof(struct ionic_rxq_desc),
+			      sizeof(struct ionic_rxq_comp),
+			      pid, &lif->rxqcqs, IONIC_ALIGN_SZ);
+	if (err) {
+		DBG_OPROM_ERR(ionic, "Failed in ionic_qcq_alloc for RX\n");
+		goto err_free_rxqcq;
+	}
+	return 0;
+err_free_rxqcq:
+	ionic_qcq_dealloc(lif->txqcqs);
+err_free_txqcq:
+	ionic_qcq_dealloc(lif->notifyqcqs);
+
+	return err;
+}
+
+/**
+ * Allocate the adminq and notifyq.
+ * */
+static int ionic_qcqs_ctl_alloc(struct lif *lif)
+{
+	struct ionic *ionic = lif->ionic;
 	unsigned int flags;
 	unsigned int pid;
 	int err = -ENOMEM;
@@ -680,8 +756,10 @@ static int ionic_qcqs_alloc(struct lif *lif)
 			      sizeof(struct ionic_admin_cmd),
 			      sizeof(struct ionic_admin_comp),
 			      pid, &lif->adminqcq, IONIC_ALIGN_SZ);
-	if (err)
-		goto err_free_adminqcq;
+	if (err) {
+		DBG_OPROM_ERR(ionic, "Failed in ionic_qcq_alloc for ADMINQ\n");
+		return err;
+	}
 
 	flags = QCQ_F_NOTIFYQ;
 	err = ionic_qcq_alloc(lif, IONIC_QTYPE_NOTIFYQ, 0, flags,
@@ -689,36 +767,14 @@ static int ionic_qcqs_alloc(struct lif *lif)
 			      sizeof(struct ionic_notifyq_cmd),
 			      sizeof(union ionic_notifyq_comp),
 			      pid, &lif->notifyqcqs, PAGE_SIZE);
-	if (err)
+	if (err) {
+		DBG_OPROM_ERR(ionic, "Failed in ionic_qcq_alloc for NOTIFYQ\n");
 		goto err_free_notifyqcq;
+	}
 
-	flags = QCQ_F_TX_STATS;
-	err = ionic_qcq_alloc(lif, IONIC_QTYPE_TXQ, 0, flags,
-			      NTXQ_DESC,
-			      sizeof(struct ionic_txq_desc),
-			      sizeof(struct ionic_txq_comp),
-			      pid, &lif->txqcqs, IONIC_ALIGN_SZ);
-	if (err)
-		goto err_free_txqcq;
-
-	flags = QCQ_F_RX_STATS;
-	err = ionic_qcq_alloc(lif, IONIC_QTYPE_RXQ, 0, flags,
-			      NRXQ_DESC,
-			      sizeof(struct ionic_rxq_desc),
-			      sizeof(struct ionic_rxq_comp),
-			      pid, &lif->rxqcqs, IONIC_ALIGN_SZ);
-	if (err)
-		goto err_free_rxqcq;
-
-	return 0;
-
-err_free_rxqcq:
-	ionic_qcq_dealloc(lif->txqcqs);
-err_free_txqcq:
-	ionic_qcq_dealloc(lif->notifyqcqs);
+    return 0;
 err_free_notifyqcq:
 	ionic_qcq_dealloc(lif->adminqcq);
-err_free_adminqcq:
 	return err;
 }
 
@@ -745,20 +801,30 @@ int ionic_lif_alloc(struct ionic *ionic, unsigned int index)
 
 	lif->info = malloc_phys(lif->info_sz, IONIC_ALIGN_SZ);
 	if (!lif->info) {
+		DBG_OPROM_ERR(ionic, "malloc_phys failed in ionic_lif_alloc for lif->info\n");
 		goto err_freelif;
 	}
 	memset (lif->info, 0, lif->info_sz);
 
+	err = dma_map (&ionic->pdev->dma, &lif->info_dma_map,
+			virt_to_phys(lif->info), lif->info_sz,
+			DMA_RX);
+	if (err) {
+		goto err_freenotify;
+	}
+
 	lif->info_pa = virt_to_phys(lif->info);
 
 	// allocate the qcqs
-	err = ionic_qcqs_alloc(lif);
+	err = ionic_qcqs_ctl_alloc(lif);
 	if (err)
-		goto err_freenotify;
+		goto err_unmapnotify;
 
 	ionic->lif = lif;
 	return 0;
 
+err_unmapnotify:
+	dma_unmap(&lif->info_dma_map);
 err_freenotify:
 	free_phys(lif->info, sizeof(lif->info_sz));
 err_freelif:
@@ -986,10 +1052,12 @@ int ionic_poll_adminq(struct lif *lif, struct ionic_admin_ctx *ctx)
  * */
 int ionic_adminq_post_wait(struct lif *lif, struct ionic_admin_ctx *ctx)
 {
+	struct ionic *ionic = lif->ionic;
 	struct queue *adminq = &lif->adminqcq->q;
 	struct ionic_admin_cmd *cmd = adminq->head->desc;
 
 	if (!ionic_q_has_space(adminq, 1)) {
+		DBG_OPROM_ERR(ionic, "No space in AdminQ\n");
 		return -ENOSPC;
 	}
 
@@ -1335,6 +1403,10 @@ static int ionic_hii_identify(struct ionic_dev *idev, struct lif *lif)
 	union ionic_hii_dev_identity hii_ident;
 	struct ionic *ionic = container_of(idev, struct ionic, idev);
 
+	/* Only supported on PFs */
+	if (ionic->pdev->device != PCI_DEVICE_ID_PENSANDO_ENET)
+		return 0;
+
 	err = ionic_dev_cmd_hii_identify(idev, devcmd_timeout);
 	if (err) {
 		DBG_OPROM_ERR(ionic, "Failed identifying the hii settings\n");
@@ -1372,9 +1444,44 @@ void ionic_lif_queue_deinit(struct ionic *ionic)
 	lif->rxqcqs->flags &= ~QCQ_F_INITED;
 }
 
+
+/**
+ * Initialize the lif for txq, rxq
+ * */
+int ionic_lif_rxtx_init(struct ionic *ionic)
+{
+	int err;
+
+	err = ionic_qcqs_rxtx_alloc(ionic->lif);
+	if (err) {
+		DBG_OPROM_ERR(ionic, "failed to initialize the qcqs_rxtx_alloc: %d\n",
+			      err);
+		return err;
+	}
+
+	err = ionic_lif_txq_init(ionic->lif, ionic->lif->txqcqs);
+	if (err) {
+		DBG_OPROM_ERR(ionic, "failed to initialize the txq: %d\n", err);
+		goto err_alloc;
+	}
+
+	err = ionic_lif_rxq_init(ionic->lif, ionic->lif->rxqcqs);
+	if (err) {
+		DBG_OPROM_ERR(ionic, "failed to initialize the rxq: %d\n", err);
+		goto err_txq_rxq_init;
+	}
+	return 0;
+err_txq_rxq_init:
+	ionic_lif_queue_deinit(ionic);
+err_alloc:
+	ionic_qcqs_rxtx_dealloc(ionic->lif);
+	return err;
+
+}
+
 /**
  * Initialize the lif
- * 1. Initialize all the queues.
+ * 1. Initialize adminq, notifyq..
  * 2. Get the MAC address.
  * */
 int ionic_lif_init(struct net_device *netdev)
@@ -1419,7 +1526,6 @@ int ionic_lif_init(struct net_device *netdev)
 		DBG_OPROM_ERR(ionic, "lif getting hii settings failed: %d\n", err);
 		goto err_reset_lif;
 	}
-//	netdev->max_pkt_len = IONIC_MAX_MTU;
 	return 0;
 
 err_reset_lif:
@@ -1541,12 +1647,14 @@ int ionic_lif_quiesce(struct lif *lif)
 void ionic_rx_flush(struct lif *lif)
 {
 	unsigned int i;
+	unsigned int rxq_ring_size = 0;
 	struct queue *rxq = &lif->rxqcqs->q;
 	struct cq *rxcq = &lif->rxqcqs->cq;
 
-	for (i = 0; i < NRXQ_DESC; i++) {
+	rxq_ring_size = ionic_rxq_ring_size(lif->ionic->netdev->mtu);
+	for (i = 0; i < rxq_ring_size; i++) {
 		if (lif->rx_iobuf[i])
-			free_iob(lif->rx_iobuf[i]);
+			free_rx_iob(lif->rx_iobuf[i]);
 		lif->rx_iobuf[i] = NULL;
 	}
 
@@ -1626,13 +1734,13 @@ void ionic_rx_fill(struct net_device *netdev, u16 length)
 	for (i = ionic_q_space_avail(rxq); i; i--) {
 
 		// Allocate I/O buffer
-		iobuf = alloc_iob(length);
+		iobuf = alloc_rx_iob(length, &ionic->pdev->dma);
 		if (!iobuf) {
 			stats->rx_alloc_fail.cnt++;
 			return;
 		}
 		desc = rxq->head->desc;
-		desc->addr = virt_to_bus(iobuf->data);
+		desc->addr = iob_dma(iobuf);
 		desc->len = length;
 		desc->opcode = IONIC_RXQ_DESC_OPCODE_SIMPLE;
 		rxq->lif->rx_iobuf[rxq->head->index] = iobuf;
@@ -1676,6 +1784,7 @@ void ionic_poll_rx(struct net_device *netdev)
 
 		// Populate I/O buffer
 		iobuf = ionic->lif->rx_iobuf[rxq->tail->index];
+		iob_unmap(iobuf);
 		ionic->lif->rx_iobuf[rxq->tail->index] = NULL;
 
 		if (comp->status ||
@@ -1711,6 +1820,7 @@ void ionic_poll_tx(struct net_device *netdev)
 	struct ionic_txq_comp *comp = txcq->tail->cq_desc;
 	struct ionic_dbg_stats *stats = ionic->dbg_stats;
 	static unsigned long tx_index_cnt = 0;
+	struct io_buffer *iobuf;
 	unsigned int index;
 
 	while (color_match(comp->color, txcq->done_color)) {
@@ -1724,9 +1834,12 @@ void ionic_poll_tx(struct net_device *netdev)
 
 		// tx coalesing, go to end of the completion index
 		do {
-			// Complete transmit
-			netdev_tx_complete(netdev, txq->lif->tx_iobuf[txq->tail->index]);
+			iobuf = txq->lif->tx_iobuf[txq->tail->index];
+			iob_unmap(iobuf);
 			txq->lif->tx_iobuf[txq->tail->index] = NULL;
+
+			// Complete transmit
+			netdev_tx_complete(netdev, iobuf);
 			stats->tx_done.cnt++;
 
 			// update the q tail index;
@@ -1949,6 +2062,7 @@ static void ionic_debug_stats_reset(struct ionic_dbg_stats *stats)
 	IONIC_DBG_STATS_FLD_INIT(stats, tx_doorbell);
 	IONIC_DBG_STATS_FLD_INIT(stats, tx_done);
 	IONIC_DBG_STATS_FLD_INIT(stats, tx_full);
+	IONIC_DBG_STATS_FLD_INIT(stats, tx_map_err);
 	IONIC_DBG_STATS_FLD_INIT(stats, rx_done);
 	IONIC_DBG_STATS_FLD_INIT(stats, rx_doorbell);
 	IONIC_DBG_STATS_FLD_INIT(stats, rx_alloc_fail);

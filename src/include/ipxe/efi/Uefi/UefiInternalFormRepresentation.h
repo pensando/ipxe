@@ -684,10 +684,10 @@ typedef struct {
 } EFI_HII_REF;
 
 typedef union {
-  UINT8           u8;
-  UINT16          u16;
-  UINT32          u32;
-  UINT64          u64;
+  UINT8           u8_1;
+  UINT16          u16_1;
+  UINT32          u32_1;
+  UINT64          u64_1;
   BOOLEAN         b;
   EFI_HII_TIME    time;
   EFI_HII_DATE    date;
@@ -1058,6 +1058,12 @@ typedef struct _EFI_IFR_NUMERIC {
   UINT8                    Flags;
   MINMAXSTEP_DATA          data;
 } EFI_IFR_NUMERIC;
+
+typedef struct _EFI_IFR_NUMERIC_BASE {
+  EFI_IFR_OP_HEADER        Header;
+  EFI_IFR_QUESTION_HEADER  Question;
+  UINT8                    Flags;
+} EFI_IFR_NUMERIC_BASE;
 
 //
 // Flags related to the numeric question

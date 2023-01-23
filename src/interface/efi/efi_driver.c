@@ -101,6 +101,44 @@ struct efi_device * efidev_parent ( struct device *dev ) {
 	return NULL;
 }
 
+#ifdef PEN_IONIC_EFIROM
+int CheckValidBindingImage( EFI_DRIVER_BINDING_PROTOCOL *driver,
+	EFI_HANDLE device ) {
+
+	EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
+	EFI_STATUS	Status;
+	union {
+		EFI_DEVICE_PATH_PROTOCOL *path;
+		void *interface;
+	} path;
+	EFI_HANDLE Handle;
+	EFI_HANDLE Image;
+	int rc = -1;
+
+	Image = driver->ImageHandle;
+
+	Status = bs->OpenProtocol (Image, \
+						&efi_loaded_image_device_path_protocol_guid, \
+						(VOID **) &path.interface, efi_image_handle, \
+						Image, \
+						EFI_OPEN_PROTOCOL_GET_PROTOCOL );
+
+	if(Status != EFI_SUCCESS) return -1;
+
+	Status = bs->LocateDevicePath ( &efi_pci_io_protocol_guid, &path.path, &Handle );
+
+	if((Status == EFI_SUCCESS) && (Handle == device)){
+		rc = 0;
+	}
+
+	Status = bs->CloseProtocol ( Image, \
+						&efi_loaded_image_device_path_protocol_guid, \
+						efi_image_handle, \
+						Image );
+	return rc;
+}
+#endif
+
 /**
  * Check to see if driver supports a device
  *
@@ -131,6 +169,9 @@ efi_driver_supported ( EFI_DRIVER_BINDING_PROTOCOL *driver __unused,
 	/* Look for a driver claiming to support this device */
 	for_each_table_entry ( efidrv, EFI_DRIVERS ) {
 		if ( ( rc = efidrv->supported ( device ) ) == 0 ) {
+#ifdef PEN_IONIC_EFIROM
+			if( ( rc = CheckValidBindingImage (driver,device) ) != 0 ) return EFI_UNSUPPORTED;
+#endif
 			DBGC ( device, "EFIDRV %s has driver \"%s\"\n",
 			       efi_handle_name ( device ), efidrv->name );
 			return 0;

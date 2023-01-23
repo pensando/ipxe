@@ -21,6 +21,7 @@
 
 FILE_LICENCE(GPL2_OR_LATER_OR_UBDL);
 
+#include <config/general.h>
 #include <errno.h>
 #include <ipxe/io.h>
 #include <stdio.h>
@@ -57,6 +58,10 @@ typedef enum
 } bool;
 
 #include "ionic_if.h"
+
+#define PCI_VENDOR_ID_PENSANDO                  0x1dd8
+#define PCI_DEVICE_ID_PENSANDO_ENET             0x1002
+#define PCI_DEVICE_ID_PENSANDO_ENETVF           0x1003
 
 #ifndef ERRFILE_ionic
 #define ERRFILE_ionic ( ERRFILE_DRIVER | 0x00cc0000 )
@@ -101,8 +106,10 @@ typedef enum
 #define DEFAULT_INTR_INDEX 0
 #define NTXQ_DESC 64
 #define NRXQ_DESC 32
+#define JUMBO_FRAMES_NRXQ_DESC 16
 #define NOTIFYQ_LENGTH	16
 #define ADMINQ_LENGTH	(1 << 2)
+#define IONIC_MAX_PKT_LEN  9216
 
 #define DBG_OPROM_ERR_CONSOLE(pci_dev, fmt, args...) \
 		dbg_printf("%02x:%02x:%x:%s: "fmt"", PCI_BUS(pci_dev->busdevfn), \
@@ -258,6 +265,7 @@ struct lif
 
 	struct ionic_lif_info *info;
 	dma_addr_t info_pa;
+	struct dma_mapping info_dma_map;
 };
 
 struct ionic_dev
@@ -292,6 +300,7 @@ struct ionic_dbg_stats
 	struct ionic_dev_debug_stats tx_doorbell;
 	struct ionic_dev_debug_stats tx_done;
 	struct ionic_dev_debug_stats tx_full;
+	struct ionic_dev_debug_stats tx_map_err;
 	struct ionic_dev_debug_stats rx_done;
 	struct ionic_dev_debug_stats rx_doorbell;
 	struct ionic_dev_debug_stats rx_alloc_fail;
@@ -338,7 +347,9 @@ int ionic_dev_setup(struct ionic_dev *idev, struct ionic_device_bar bars[],
 int ionic_identify(struct ionic *ionic);
 int ionic_lif_alloc(struct ionic *ionic, unsigned int index);
 int ionic_lif_init(struct net_device *netdev);
+int ionic_lif_rxtx_init(struct ionic *ionic);
 void ionic_qcq_dealloc(struct qcq *qcq);
+void ionic_qcqs_rxtx_dealloc(struct lif *lif);
 
 //Netops helper functions
 int ionic_qcq_enable(struct qcq *qcq);

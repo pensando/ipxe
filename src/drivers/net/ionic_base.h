@@ -21,7 +21,7 @@
 
 #include <stdio.h>
 
-#define DRV_VERSION "1.3"
+#define DRV_VERSION "2.0"
 #define IPXE_VERSION_CODE 1
 #define UEFI_VERSION_CODE 2.4
 #define IPXE_OS_DIST_STR "iPXE"
